@@ -1,0 +1,6 @@
+{
+  "name": "Karnataka 1st PUC Physics AI Tutor",
+  "description": "An AI-powered Physics Tutor for Karnataka PUC Board focusing on Chapter 8: Electromagnetic Waves with high-fidelity RAG, DeepSeek R1 reasoning processes, full board exam simulations, and answer validation scripts.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
