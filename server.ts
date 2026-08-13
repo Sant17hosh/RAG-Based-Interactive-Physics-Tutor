@@ -2062,14 +2062,21 @@ ${contextText || 'Use standard NCERT 1st PUC Physics principles.'}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Streaming Ask-Tutor endpoint — sends tokens to the browser as they arrive
-// Uses Server-Sent Events (SSE) so the user sees words appearing in real-time
+// ─────────────────────────────────────────────────────────────────────────────
+// ASK TUTOR STREAMING ENDPOINT — 4-Step RAG Pipeline
+// Pipeline:
+//  [1] searchNCERTChunks() → Retrieves TOP 3 relevant chunks (ChromaDB / Keyword)
+//  [2] generateLocalTutorFallback() → Intercepts Greetings / Off-topic / Quiz / Notes
+//  [3] queryOllama() → Sends top 3 chunks to phi3:mini (temp: 0.0, predict: ~150, ctx: 1024)
+//  [4] SSE Streaming → Streams tokens word-by-word live to AskTutor.tsx bubble
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/chat-stream', authenticateToken, async (req: any, res) => {
   const reqStart = Date.now();
   try {
     const { message, originalQuery, chapterId, bloomLevel, includeExample } = req.body;
+    const queryText = originalQuery || message || '';
 
-    // ── SSE headers ────────────────────────────────────────────────────────────
+    // ── Set up SSE headers ───────────────────────────────────────────────────
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -2080,83 +2087,80 @@ app.post('/api/chat-stream', authenticateToken, async (req: any, res) => {
       res.write(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    // ── STEP 1: searchNCERTChunks ───────────────────────────────────────────
-    // Retrieve TOP 3 most relevant NCERT chunks for this query
-    const retrieved = searchNCERTChunks(message, chapterId, bloomLevel);
+    // ── [STEP 1] searchNCERTChunks() — Retrieve TOP 3 most relevant chunks ─────
+    const retrieved = searchNCERTChunks(queryText, chapterId, bloomLevel);
     const top3Chunks = retrieved.slice(0, 3);
-    // Build a rich context block from all 3 chunks
     const contextText = top3Chunks.map((c: any) =>
-      `[Section: "${c.section}"]\n${c.content.slice(0, 700)}`
+      `[Section: "${c.section}"]\n${c.content}`
     ).join('\n\n---\n\n');
+
     const selectedChapter = CHANNELS_PUC_DATA.find(c => c.id === Number(chapterId));
 
-    // ── STEP 2: generateLocalTutorFallback (offline decision engine) ─────────
-    // Used ONLY as the instant fallback if Ollama is offline.
-    // For greetings/off-topic/quiz/notes it responds instantly without LLM.
-    // For general questions it builds a context-grounded answer from chunks.
-    // (When Ollama IS online we bypass this and go straight to Step 3.)
+    // ── [STEP 2] generateLocalTutorFallback() — Check for instant intercepts ──
+    // Intercepts: Greetings | Off-topic | MCQ/Quiz requests | Revision Notes
+    const qLower = queryText.toLowerCase().trim();
+    const isGreeting = ["hello", "hi", "hey", "good morning", "good afternoon", "namaste"].includes(qLower);
+    const isOffTopic = /^(who is|who was|whatsapp|instagram|youtube|facebook|cricket|ipl|movie|song|actor)/i.test(qLower);
+    const isQuizReq = (qLower.includes("mcq") || qLower.includes("quiz") || qLower.includes("practice test"));
+    const isNotesReq = (qLower.includes("revision note") || qLower.includes("summary note") || qLower.includes("chapter summary"));
 
-    // ── Detect question type to tune Ollama output length ──────────────────
-    const msgLower = (originalQuery || message || '').toLowerCase();
-    const isDerivation = msgLower.includes('derive') || msgLower.includes('derivation') || msgLower.includes('prove') || msgLower.includes('proof') || msgLower.includes('formula for');
-    const isNumerical  = msgLower.includes('numerical') || msgLower.includes('calculate') || msgLower.includes('solve') || /\b\d+\s*(m|s|kg|v|w|a|t|f|hz)\b/i.test(msgLower);
-    const isTheory     = msgLower.includes('what is') || msgLower.includes('define') || msgLower.includes('explain') || msgLower.includes('state') || msgLower.includes('distinguish');
-    const isSimple     = !isDerivation && !isNumerical && !isTheory && (msgLower.split(/\s+/).length < 8);
-
-    let systemInstruction = '';
-    let numPredict = 350;
-    let questionTypeLabel = 'Theory';
-
-    if (isSimple) {
-      questionTypeLabel = 'Simple Query'; numPredict = 180;
-      systemInstruction = `You are a Karnataka 1st PUC Physics Tutor.\nRULES:\n1. Answer ONLY from the NCERT Context below.\n2. Be concise and direct — no preamble, no <thinking> tags.\n3. No LaTeX. Use plain unicode (e.g. Phi_B = B*A*cos(theta)).`;
-    } else if (isDerivation) {
-      questionTypeLabel = 'Derivation'; numPredict = 400;
-      systemInstruction = `You are a Karnataka 1st PUC Physics Tutor.\nRULES:\n1. Derive ONLY from the NCERT Context below.\n2. No preamble, no <thinking> tags.\n3. Format: Assumptions → Steps → Final formula → SI units.\n4. No LaTeX.`;
-    } else if (isNumerical) {
-      questionTypeLabel = 'Numerical'; numPredict = 380;
-      systemInstruction = `You are a Karnataka 1st PUC Physics Tutor.\nRULES:\n1. Solve using NCERT Context below.\n2. No preamble, no <thinking> tags.\n3. Format: Given | Formula | Substitution | Answer.\n4. No LaTeX.`;
-    } else {
-      questionTypeLabel = 'Theory'; numPredict = 380;
-      systemInstruction = `You are a Karnataka 1st PUC Physics Tutor.\nRULES:\n1. Explain ONLY from the NCERT Context below.\n2. No preamble, no <thinking> tags.\n3. Format: Definition → Explanation → Key points → Formula.\n4. No LaTeX.`;
-    }
-
-    const prompt = `Student Question: "${originalQuery || message}"\nChapter: ${selectedChapter ? `Ch ${selectedChapter.id} - ${selectedChapter.name}` : 'General Physics'}\nBloom Level: ${bloomLevel || 'Understand'}\n\n=== NCERT Context (Top 3 Relevant Sections) ===\n${contextText || 'Use standard Karnataka 1st PUC Physics principles.'}`;
-
-    // ── In-memory cache check (instant replay if same question asked again) ──
-    const cacheKey = `stream:${activeModel}:${questionTypeLabel}:${prompt}`;
-    if (aiResponseCache.has(cacheKey)) {
-      const cached = aiResponseCache.get(cacheKey)!;
-      sendEvent('thinking', { thinking: `⚡ [CACHED] Instant replay. 0ms.` });
-      sendEvent('token',    { token: cached.response });
-      sendEvent('done',     { totalTimeMs: Date.now() - reqStart, cached: true, questionType: questionTypeLabel });
+    if (isGreeting || isOffTopic || isQuizReq || isNotesReq) {
+      const instantResponse = generateLocalTutorFallback(queryText, top3Chunks, includeExample);
+      sendEvent('thinking', { thinking: instantResponse.thinking || "Instant handler active." });
+      sendEvent('token', { token: instantResponse.content });
+      sendEvent('done', { totalTimeMs: Date.now() - reqStart, cached: true, questionType: 'Instant Intercept' });
       res.end();
       return;
     }
 
-    // ── STEP 3: queryOllama — stream tokens directly ────────────────────────
+    // ── Check in-memory cache for instant replay (0ms) ────────────────────────
+    const cacheKey = `stream:${activeModel}:${queryText}:${chapterId}`;
+    if (aiResponseCache.has(cacheKey)) {
+      const cached = aiResponseCache.get(cacheKey)!;
+      sendEvent('thinking', { thinking: `⚡ [CACHED] Replaying response. 0ms.` });
+      sendEvent('token', { token: cached.response });
+      sendEvent('done', { totalTimeMs: Date.now() - reqStart, cached: true, questionType: 'Cached' });
+      res.end();
+      return;
+    }
+
+    // ── [STEP 3] queryOllama() — Prepare prompt & system instructions ────────
+    const systemInstruction = `You are a Karnataka 1st PUC Physics Tutor.
+STRICT DIRECTIVES:
+1. Answer the student's question using ONLY the provided NCERT Context below.
+2. Be extremely direct and concise (~150 tokens max). No preamble, no <thinking> tags.
+3. Use clear physics definitions, equations, and SI units.
+4. Do NOT use LaTeX math syntax ($ or $$). Write equations in plain text (e.g. e = -dPhi_B / dt).`;
+
+    const prompt = `Student Question: "${queryText}"
+Chapter: ${selectedChapter ? `Ch ${selectedChapter.id} - ${selectedChapter.name}` : 'General Physics'}
+Bloom Target: ${bloomLevel || 'Understand'}
+
+=== NCERT Context (Top 3 Relevant Sections) ===
+${contextText || 'Use standard Karnataka 1st PUC Physics principles.'}`;
+
     const ollamaUrl = OLLAMA_URL.replace(/\/$/, '');
     const streamPayload = {
       model: activeModel,
       prompt,
       system: systemInstruction,
-      stream: true,           // ← true: each token arrives immediately
-      keep_alive: -1,         // ← model stays hot in RAM
+      stream: true,
+      keep_alive: -1, // Keep model hot in RAM
       options: {
-        temperature: 0.0,     // deterministic answers
-        num_predict: numPredict,
-        num_ctx: 768,         // enough for 3 chunks + question
+        temperature: 0.0,
+        num_predict: 150,   // ~150 tokens output limit as requested
+        num_ctx: 1024,      // 1024 context window as requested
         top_k: 20,
         top_p: 0.3,
         num_thread: 4
       }
     };
 
-    sendEvent('thinking', { thinking: `🧠 [${activeModel}] [${questionTypeLabel}] Retrieving from ${top3Chunks.length} NCERT sections…` });
+    sendEvent('thinking', { thinking: `🧠 [Model: ${activeModel}] Querying local model using ${top3Chunks.length} NCERT sections…` });
 
     let fullResponse = '';
     try {
-      // ── STEP 4: SSE → stream tokens word-by-word to the browser ──────────
+      // ── [STEP 4] Stream tokens word-by-word via SSE to AskTutor.tsx ───────
       const ollamaResp = await fetch(`${ollamaUrl}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2165,12 +2169,12 @@ app.post('/api/chat-stream', authenticateToken, async (req: any, res) => {
       });
 
       if (!ollamaResp.ok || !ollamaResp.body) {
-        throw new Error(`Ollama returned ${ollamaResp.status}`);
+        throw new Error(`Ollama stream returned status ${ollamaResp.status}`);
       }
 
       verifiedModelsCache.add(activeModel);
 
-      const reader  = ollamaResp.body.getReader();
+      const reader = ollamaResp.body.getReader();
       const decoder = new TextDecoder();
 
       while (true) {
@@ -2191,32 +2195,35 @@ app.post('/api/chat-stream', authenticateToken, async (req: any, res) => {
       }
 
     } catch (ollamaErr: any) {
-      // ── STEP 2 activates here: Ollama offline → local fallback ─────────
-      console.warn('[chat-stream] Ollama offline — local CPU fallback active:', ollamaErr.message);
-      const fallback = generateLocalTutorFallback(originalQuery || message, retrieved, includeExample);
+      // Offline fallback: If Ollama daemon is offline, generate local response from chunks
+      console.warn('[chat-stream] Local CPU fallback triggered:', ollamaErr.message);
+      const fallback = generateLocalTutorFallback(queryText, top3Chunks, includeExample);
       fullResponse = fallback.content;
       sendEvent('token', { token: fullResponse });
     }
 
-    // Cache and close
     const totalTimeMs = Date.now() - reqStart;
     aiResponseCache.set(cacheKey, { response: fullResponse, backendTimeMs: totalTimeMs, ollamaTimeMs: totalTimeMs });
-    sendEvent('done', { totalTimeMs, cached: false, questionType: questionTypeLabel });
+    sendEvent('done', { totalTimeMs, cached: false, questionType: 'LLM Stream' });
     res.end();
 
-    // Persist to history DB (non-blocking)
+    // Persist to database
     try {
       await query(
         "INSERT INTO tutor_history (user_id, question, answer, chapter, bloom_level) VALUES ($1, $2, $3, $4, $5)",
-        [req.user.userId, originalQuery || message, fullResponse.trim(), selectedChapter?.name || 'General Physics', bloomLevel || 'Understand']
+        [req.user.userId, queryText, fullResponse.trim(), selectedChapter?.name || 'General Physics', bloomLevel || 'Understand']
       );
     } catch (_) {}
 
   } catch (err: any) {
     console.error('[chat-stream] Fatal error:', err);
-    try { res.write(`event: error\ndata: ${JSON.stringify({ message: err.message })}\n\n`); res.end(); } catch (_) {}
+    try {
+      res.write(`event: error\ndata: ${JSON.stringify({ message: err.message })}\n\n`);
+      res.end();
+    } catch (_) {}
   }
 });
+
 
 // Generate Exam Paper with Karnataka marks distribution (Part A, B, C, D)
 app.post('/api/generate-exam', authenticateToken, async (req: any, res) => {
